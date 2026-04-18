@@ -2,7 +2,8 @@ import os
 import logging
 import threading
 
-from common import middleware, message_protocol, fruit_item
+from common import middleware, fruit_item
+import common.message_protocol.internal as protocol
 
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
@@ -24,35 +25,44 @@ class SumFilter:
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
             self.data_output_exchanges.append(data_output_exchange)
-        self.amount_by_fruit = {}
+        self.sums_by_client: dict[str, dict[str, fruit_item.FruitItem]] = {}
 
-    def _process_data(self, fruit, amount):
+    def _process_data(self, client_id, fruit, amount):
         logging.info(f"Process data")
-        self.amount_by_fruit[fruit] = self.amount_by_fruit.get(
+        if not client_id in self.sums_by_client:
+            self.sums_by_client[client_id] = {}
+        
+        client_amount_by_fruit = self.sums_by_client[client_id]
+        client_amount_by_fruit[fruit] = client_amount_by_fruit.get(
             fruit, fruit_item.FruitItem(fruit, 0)
         ) + fruit_item.FruitItem(fruit, int(amount))
 
-    def _process_eof(self):
+    def _process_eof(self, client_id):
         logging.info(f"Broadcasting data messages")
-        for final_fruit_item in self.amount_by_fruit.values():
+        for final_fruit_item in self.sums_by_client[client_id].values():
+            out_fru_msg = protocol.FruMessage(
+                client_id,
+                protocol.MsgType.FRUIT_RECORD, 
+                [final_fruit_item.fruit, final_fruit_item.amount]
+            )
             for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [final_fruit_item.fruit, final_fruit_item.amount]
-                    )
-                )
+                data_output_exchange.send(out_fru_msg.serialize())
 
         logging.info(f"Broadcasting EOF message")
+        out_end_fru_msg = protocol.FruMessage(client_id, protocol.MsgType.END_OF_RECODS, [])
         for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([]))
+            data_output_exchange.send(out_end_fru_msg.serialize())
 
 
     def process_data_messsage(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
+        fru_msg = protocol.FruMessage.deserialize(message)
+        if fru_msg.msg_type == protocol.MsgType.FRUIT_RECORD:
+            self._process_data(fru_msg.client_id, *fru_msg.data)
+        elif fru_msg.msg_type == protocol.MsgType.END_OF_RECODS:
+            self._process_eof(fru_msg.client_id)
         else:
-            self._process_eof(*fields)
+            ack()
+            raise RuntimeError(f"Unsupported message type {fru_msg.msg_type}")
         ack()
 
     def start(self):

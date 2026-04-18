@@ -1,18 +1,22 @@
-from common import message_protocol
-
+import uuid
+from common.message_protocol.internal import FruMessage, MsgType
 
 class MessageHandler:
 
     def __init__(self):
-        pass
+        self.client_id = uuid.uuid4().hex
     
     def serialize_data_message(self, message):
         [fruit, amount] = message
-        return message_protocol.internal.serialize([fruit, amount])
+        fru_msg = FruMessage(self.client_id, MsgType.FRUIT_RECORD, [fruit, amount])
+        return fru_msg.serialize()
 
     def serialize_eof_message(self, message):
-        return message_protocol.internal.serialize([])
+        fru_msg = FruMessage(self.client_id, MsgType.END_OF_RECODS, [])
+        return fru_msg.serialize()
 
     def deserialize_result_message(self, message):
-        fields = message_protocol.internal.deserialize(message)
-        return fields
+        fru_msg = FruMessage.deserialize(message)
+        if fru_msg.client_id == self.client_id:
+            return fru_msg.data
+        return None
