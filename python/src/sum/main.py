@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import time
 
 from common import middleware, fruit_item
 import common.message_protocol.internal as protocol
@@ -19,6 +20,12 @@ class SumFilter:
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
+        self.control_exchange_in = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_PREFIX}_{i}" for i in range(SUM_AMOUNT)],
+        )
+        self.control_exchange_out = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_PREFIX}_{ID}"],
+        )
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
             data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
@@ -26,18 +33,28 @@ class SumFilter:
             )
             self.data_output_exchanges.append(data_output_exchange)
         self.sums_by_client: dict[str, dict[str, fruit_item.FruitItem]] = {}
+        self.eof_by_client: dict[str, bool]
+        # This lock prevents handling an EOF_NOTIFY while an input data is being processed
+        self.flying_input_lock = threading.Lock()
 
     def _process_data(self, client_id, fruit, amount):
-        logging.info(f"Process data")
+        logging.info(f"Process data for {client_id}")
         if not client_id in self.sums_by_client:
             self.sums_by_client[client_id] = {}
         
+        #Uncomment to trigger issues (without qos=1)
+        #time.sleep(0.04)
         client_amount_by_fruit = self.sums_by_client[client_id]
         client_amount_by_fruit[fruit] = client_amount_by_fruit.get(
             fruit, fruit_item.FruitItem(fruit, 0)
         ) + fruit_item.FruitItem(fruit, int(amount))
 
     def _process_eof(self, client_id):
+        logging.info(f"Broadcasting EOF_NOTIFY message for {client_id}")
+        out_notify_fru_msg = protocol.FruMessage(client_id, protocol.MsgType.END_OF_RECODS_NOTIFY, [])
+        self.control_exchange_out.send(out_notify_fru_msg.serialize())
+
+    def _process_eof_notify(self, client_id):
         logging.info(f"Broadcasting data messages")
         for final_fruit_item in self.sums_by_client[client_id].values():
             out_fru_msg = protocol.FruMessage(
@@ -48,25 +65,35 @@ class SumFilter:
             for data_output_exchange in self.data_output_exchanges:
                 data_output_exchange.send(out_fru_msg.serialize())
 
-        logging.info(f"Broadcasting EOF message")
+        logging.info(f"Broadcasting EOF message for {client_id}")
         out_end_fru_msg = protocol.FruMessage(client_id, protocol.MsgType.END_OF_RECODS, [])
         for data_output_exchange in self.data_output_exchanges:
             data_output_exchange.send(out_end_fru_msg.serialize())
 
-
     def process_data_messsage(self, message, ack, nack):
         fru_msg = protocol.FruMessage.deserialize(message)
-        if fru_msg.msg_type == protocol.MsgType.FRUIT_RECORD:
-            self._process_data(fru_msg.client_id, *fru_msg.data)
-        elif fru_msg.msg_type == protocol.MsgType.END_OF_RECODS:
-            self._process_eof(fru_msg.client_id)
-        else:
+        with self.flying_input_lock:
+            if fru_msg.msg_type == protocol.MsgType.FRUIT_RECORD:
+                self._process_data(fru_msg.client_id, *fru_msg.data)
+            elif fru_msg.msg_type == protocol.MsgType.END_OF_RECODS:
+                self._process_eof(fru_msg.client_id)
+            elif fru_msg.msg_type == protocol.MsgType.END_OF_RECODS_NOTIFY:
+                self._process_eof_notify(fru_msg.client_id)
+            else:
+                logging.error(f"Unsupported message type {fru_msg.msg_type}")
             ack()
-            raise RuntimeError(f"Unsupported message type {fru_msg.msg_type}")
-        ack()
 
     def start(self):
+        notify_listener = threading.Thread(
+            target=self.control_exchange_in.start_consuming,
+            args=(self.process_data_messsage,),
+            daemon=True,
+        )
+        notify_listener.start()
+
         self.input_queue.start_consuming(self.process_data_messsage)
+
+        # TODO close connections, join thread
 
 def main():
     logging.basicConfig(level=logging.INFO)

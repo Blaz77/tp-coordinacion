@@ -5,6 +5,7 @@ class MsgType:
     FRUIT_TOP = 2
     ACK = 3
     END_OF_RECODS = 4
+    END_OF_RECODS_NOTIFY = 5
 
 class FruMessage:
     def __init__(self, client_id: str, msg_type: MsgType, data):
