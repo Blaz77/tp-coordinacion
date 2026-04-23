@@ -55,7 +55,8 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
     def close(self):
         try:
-            self.connection.close()
+            if self.connection and self.connection.is_open:
+                self.connection.close()
         except Exception as e:
             raise MessageMiddlewareCloseError() from e
 
@@ -114,6 +115,7 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
 
     def close(self):
         try:
-            self.connection.close()
+            if self.connection and self.connection.is_open:
+                self.connection.close()
         except Exception as e:
             raise MessageMiddlewareCloseError() from e

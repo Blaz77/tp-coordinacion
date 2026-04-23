@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 import threading
 import time
 
@@ -26,7 +27,7 @@ class SumFilter:
         self.control_exchange_out = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_PREFIX}_{ID}"],
         )
-        self.data_output_exchanges = []
+        self.data_output_exchanges: list[middleware.MessageMiddlewareExchangeRabbitMQ] = []
         for i in range(AGGREGATION_AMOUNT):
             data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
@@ -36,6 +37,7 @@ class SumFilter:
         self.eof_by_client: dict[str, bool]
         # This lock prevents handling an EOF_NOTIFY while an input data is being processed
         self.flying_input_lock = threading.Lock()
+        self.notify_listener: threading.Thread = None
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Process data for {client_id}")
@@ -84,20 +86,42 @@ class SumFilter:
             ack()
 
     def start(self):
-        notify_listener = threading.Thread(
+        self.notify_listener = threading.Thread(
             target=self.control_exchange_in.start_consuming,
-            args=(self.process_data_messsage,),
-            daemon=True,
+            args=(self.process_data_messsage,)
         )
-        notify_listener.start()
-
+        self.notify_listener.start()
         self.input_queue.start_consuming(self.process_data_messsage)
 
-        # TODO close connections, join thread
+        self.stop()
+
+    def stop(self):
+        logging.info("Stopping SumFilter...")
+        try:
+            self.control_exchange_in.stop_consuming()
+        except Exception as e:
+            logging.error(e)
+
+        if self.notify_listener and self.notify_listener.is_alive():
+            self.notify_listener.join()
+
+        self.control_exchange_in.close()
+        self.control_exchange_out.close()
+        self.input_queue.close()
+        for exchange in self.data_output_exchanges:
+            exchange.close()
+    
+def handle_sigterm(sum_filter: SumFilter):
+    logging.info("SIGTERM received")
+    try:
+        sum_filter.input_queue.stop_consuming()
+    except Exception as e:
+        logging.error(e)
 
 def main():
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
+    signal.signal(signal.SIGTERM, lambda s, f: handle_sigterm(sum_filter))
     sum_filter.start()
     return 0
 
