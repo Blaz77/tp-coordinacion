@@ -21,18 +21,9 @@ class SumFilter:
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
-        self.control_exchange_in = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_PREFIX}_{i}" for i in range(SUM_AMOUNT)],
-        )
         self.control_exchange_out = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_PREFIX}_{ID}"],
         )
-        self.data_output_exchanges: list[middleware.MessageMiddlewareExchangeRabbitMQ] = []
-        for i in range(AGGREGATION_AMOUNT):
-            data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
-            )
-            self.data_output_exchanges.append(data_output_exchange)
         self.sums_by_client: dict[str, dict[str, fruit_item.FruitItem]] = {}
         self.eof_by_client: dict[str, bool]
         # This lock prevents handling an EOF_NOTIFY while an input data is being processed
@@ -72,7 +63,7 @@ class SumFilter:
         self.control_exchange_out.send(out_notify_fru_msg.serialize())
 
     def _process_eof_notify(self, client_id):
-        logging.info(f"Broadcasting data messages for {client_id}")
+        logging.info(f"Sending data messages for {client_id}")
         sums_by_agg_instance = self._generate_agg_distribution(self.sums_by_client.pop(client_id))
         affected_aggregators = []
         for agg_idx in range(len(sums_by_agg_instance)):
@@ -91,45 +82,63 @@ class SumFilter:
         out_end_fru_msg = protocol.FruMessage(client_id, protocol.MsgType.END_OF_RECODS, [])
         for data_output_exchange in self.data_output_exchanges:
             data_output_exchange.send(out_end_fru_msg.serialize())
-
-    def process_data_messsage(self, message, ack, nack):
-        fru_msg = protocol.FruMessage.deserialize(message)
+    
+    def process_control_message(self, message, ack, nack):
         with self.flying_input_lock:
+            fru_msg = protocol.FruMessage.deserialize(message)
+            if fru_msg.msg_type == protocol.MsgType.END_OF_RECODS_NOTIFY:
+                self._process_eof_notify(fru_msg.client_id)
+            else:
+                logging.error(f"Unsupported control message type {fru_msg.msg_type}")
+            ack()
+            
+    def process_data_messsage(self, message, ack, nack):
+        with self.flying_input_lock:
+            fru_msg = protocol.FruMessage.deserialize(message)
             if fru_msg.msg_type == protocol.MsgType.FRUIT_RECORD:
                 self._process_data(fru_msg.client_id, *fru_msg.data)
             elif fru_msg.msg_type == protocol.MsgType.END_OF_RECODS:
                 self._process_eof(fru_msg.client_id)
-            elif fru_msg.msg_type == protocol.MsgType.END_OF_RECODS_NOTIFY:
-                self._process_eof_notify(fru_msg.client_id)
             else:
-                logging.error(f"Unsupported message type {fru_msg.msg_type}")
+                logging.error(f"Unsupported data message type {fru_msg.msg_type}")
             ack()
+    
+    def _control_worker(self):
+        self.control_exchange_in = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_PREFIX}_{i}" for i in range(SUM_AMOUNT)],
+        )
+        self.data_output_exchanges: list[middleware.MessageMiddlewareExchangeRabbitMQ] = []
+        for i in range(AGGREGATION_AMOUNT):
+            data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+                MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
+            )
+            self.data_output_exchanges.append(data_output_exchange)
+
+        self.control_exchange_in.start_consuming(self.process_control_message)
+
+        self.control_exchange_in.close()
+        for exchange in self.data_output_exchanges:
+            exchange.close()
 
     def start(self):
-        self.notify_listener = threading.Thread(
-            target=self.control_exchange_in.start_consuming,
-            args=(self.process_data_messsage,)
-        )
+        self.notify_listener = threading.Thread(target=self._control_worker,)
         self.notify_listener.start()
         self.input_queue.start_consuming(self.process_data_messsage)
-
+        
         self.stop()
 
     def stop(self):
         logging.info("Stopping SumFilter...")
-        try:
-            self.control_exchange_in.stop_consuming()
-        except Exception as e:
-            logging.error(e)
 
         if self.notify_listener and self.notify_listener.is_alive():
+            try:
+                self.control_exchange_in.stop_consuming()
+            except Exception as e:
+                logging.error(e)
             self.notify_listener.join()
 
-        self.control_exchange_in.close()
         self.control_exchange_out.close()
         self.input_queue.close()
-        for exchange in self.data_output_exchanges:
-            exchange.close()
     
 def handle_sigterm(sum_filter: SumFilter):
     logging.info("SIGTERM received")
