@@ -45,3 +45,17 @@ En la búsqueda de una solución adecuada, se exploraron otras opciones que fuer
 **Regreso a input queue:** Consiste en que cada instancia de Sum, al recibir el EOF, reingrese el mensaje incrementando en 1 un contador de visitas, si es la primera vez que se recibe el EOF del cliente, a la vez que se entregan los subtotales a los Aggregators. Cuando se recibe un EOF cuyo contador coincide con el total de instancias Sum, se deja de reingresar el mensaje. Se descartó porque la aleatoriedad de este esquema puede incrementar enormemente los tiempos de procesamiento totales por cliente, además de generar tráfico adicional de mensajes
 
 **Canales de RabbitMQ compartidos:** Por la forma en que el middleware internamente gestiona los canales, es posible vincular la input queue y el exchange de control al mismo canal, compartiendo la conexión. De esa forma, al recibir un EOF_NOTIFY, este solo se procesará luego de los mensajes presentes en el buffer de prefetch. Esta opción tendría buenos resultados, pero se descartó por requerir cambios en la interfaz dada que rompen con la abstracción y el encapsulamiento, al depender de detalles de implementación de RabbitMQ
+
+## Coordinación entre instancias Sum y Aggregation
+
+Para eliminar la repetición de trabajo de las instancias Aggregation, se hizo una división por nombre de frutas. De esta manera, se pueden generar subtotales y tops parciales, garantizando la no intersección con las demaás instancias. Para ello, en las instancias de Sum se implementó un distribuidor de mensajes de subtotales, donde cada fruta se envía a una instancia u otra de Aggregation según el resultado de un Hash sobre el nombre de la fruta. La función de hash esta hecha a medida, para tener buena performance y aprovechar todas las instancias que sean posibles. Para esto se hace un cálculo en base al valor de cada caracter y su posición en el string.
+
+## Uso de threads vs procesos
+
+El sistema de threads en Python está limitado por el GIL (Global Interpreter Lock), que impide la ejecución simultánea de bytecodes en más de un thread. En el caso de operaciones de calculo intensivo, es una desventaja que motiva fuertemente al uso de procesos para beneficiarse de paralelismo real (Cuando el entorno lo permite). Sin embargo este no es el caso, ya que las operaciones a realizar son simples y el cuello de botella son las esperas debido a usar conexiones bloqueantes con el middleware. Por lo tanto, el uso de threads en vez de procesos sigue siendo una opción razonable para este caso.
+
+## Escalabilidad
+
+Esta solución es escalable respecto a la cantidad de clientes, asi como instancias asignadas a cada etapa. Al aumentar la cantidad de clientes, se debe tener en cuenta que cada instancia guarda temporalmente un estado para ese cliente, que se descarta al terminar las operaciones. Por ello, si la cantidad es extremadamente grande, se puede evaluar un volvado selectivo a disco en caso de que haya picos muy altos de consumo de memoria.
+
+Para la cantidad de instancias por etapa, los tiempos de procesamiento mejoran al aumentar la cantidad de instacias, siempre que se mantenga en valores razonables. Un ejemplo donde esto no se cumple, es cuando se tienen muchas más instancias de Sum o Aggregation que los Fruit_records a procesar. En ese caso no se obtienen mejoras al escalar, por el contrario, el overhead de comunicación puede generar congestioón en la red que empeore los tiempos. Si este caso puede llegar a ocurrir en el uso normal, sería conveniente implementar alguna técnica de clustering por cliente.
