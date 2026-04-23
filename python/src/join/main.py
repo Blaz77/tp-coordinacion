@@ -1,6 +1,7 @@
 import bisect
 import os
 import logging
+import signal
 
 from common import middleware, fruit_item
 import common.message_protocol.internal as protocol
@@ -60,11 +61,24 @@ class JoinFilter:
 
     def start(self):
         self.input_queue.start_consuming(self.process_messsage)
+        self.stop()
 
+    def stop(self):
+        logging.info("Stopping JoinFilter...")
+        self.input_queue.close()
+        self.output_queue.close()
+
+def handle_sigterm(join_filter: JoinFilter):
+    logging.info("SIGTERM received")
+    try:
+        join_filter.input_queue.stop_consuming()
+    except Exception as e:
+        logging.error(e)
 
 def main():
     logging.basicConfig(level=logging.INFO)
     join_filter = JoinFilter()
+    signal.signal(signal.SIGTERM, lambda s, f: handle_sigterm(join_filter))
     join_filter.start()
 
     return 0
