@@ -49,7 +49,7 @@ class AggregationFilter:
             return
         
         logging.info(f"All EOF received for {client_id}")
-        client_fruit_top = self.fruit_top_by_client[client_id]
+        client_fruit_top = self.fruit_top_by_client.pop(client_id, [])
         fruit_chunk = list(client_fruit_top[-TOP_SIZE:])
         fruit_chunk.reverse()
         fruit_top = list(
@@ -60,7 +60,6 @@ class AggregationFilter:
         )
         out_top_msg = protocol.FruMessage(client_id, protocol.MsgType.FRUIT_TOP, fruit_top)
         self.output_queue.send(out_top_msg.serialize())
-        del self.fruit_top_by_client[client_id]
         del self.end_by_client[client_id]
 
     def process_messsage(self, message, ack, nack):
