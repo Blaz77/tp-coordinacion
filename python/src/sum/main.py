@@ -39,6 +39,21 @@ class SumFilter:
         self.flying_input_lock = threading.Lock()
         self.notify_listener: threading.Thread = None
 
+    def _hash_fruit(self, fruit: str):
+        # Prime numbers should work well for the amplifier (Neither too big or too small)
+        AMPLIFIER = 31
+        hash = 0
+        for c in fruit:
+            hash = hash * AMPLIFIER + ord(c)
+        return hash % AGGREGATION_AMOUNT
+    
+    def _generate_agg_distribution(self, sums: dict[str, fruit_item.FruitItem]) -> list[list[fruit_item.FruitItem]]:
+        sums_by_agg_instance = [[] for _ in range(AGGREGATION_AMOUNT)]
+        for final_fruit_item in sums.values():
+            dst_instance = self._hash_fruit(final_fruit_item.fruit)
+            sums_by_agg_instance[dst_instance].append(final_fruit_item)
+        return sums_by_agg_instance
+
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Process data for {client_id}")
         if not client_id in self.sums_by_client:
@@ -57,15 +72,20 @@ class SumFilter:
         self.control_exchange_out.send(out_notify_fru_msg.serialize())
 
     def _process_eof_notify(self, client_id):
-        logging.info(f"Broadcasting data messages")
-        for final_fruit_item in self.sums_by_client[client_id].values():
-            out_fru_msg = protocol.FruMessage(
-                client_id,
-                protocol.MsgType.FRUIT_RECORD, 
-                [final_fruit_item.fruit, final_fruit_item.amount]
-            )
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(out_fru_msg.serialize())
+        logging.info(f"Broadcasting data messages for {client_id}")
+        sums_by_agg_instance = self._generate_agg_distribution(self.sums_by_client.pop(client_id))
+        affected_aggregators = []
+        for agg_idx in range(len(sums_by_agg_instance)):
+            if len(sums_by_agg_instance[agg_idx]) > 0:
+                affected_aggregators.append(agg_idx)
+
+            for final_fruit_item in sums_by_agg_instance[agg_idx]:
+                out_fru_msg = protocol.FruMessage(
+                    client_id,
+                    protocol.MsgType.FRUIT_RECORD, 
+                    [final_fruit_item.fruit, final_fruit_item.amount]
+                )
+                self.data_output_exchanges[agg_idx].send(out_fru_msg.serialize())
 
         logging.info(f"Broadcasting EOF message for {client_id}")
         out_end_fru_msg = protocol.FruMessage(client_id, protocol.MsgType.END_OF_RECODS, [])
